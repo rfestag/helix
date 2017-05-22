@@ -22,7 +22,12 @@ Or install it yourself as:
 
 ## Usage
 
-TODO: Write usage instructions here
+Test application: 
+
+```bash
+bundle install
+bundle exec example/test.rb
+```
 
 ## Development
 
