@@ -36,5 +36,5 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "pry"
   spec.add_runtime_dependency 'http',             '~> 2.2.2'
   spec.add_runtime_dependency 'http-2',           '~> 0.8.4'
-  spec.add_runtime_dependency 'async',           '~> 0.13.0'
+  spec.add_runtime_dependency 'nio4r'
 end

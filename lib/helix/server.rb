@@ -1,97 +1,84 @@
-require 'async'
-require 'async/tcp_socket'
-require 'async/ssl_socket'
+require "nio"
+require "socket"
+require 'openssl'
 require 'http/2'
 
 module Helix
-  class Server 
+  class Server
     ALPN_PROTOCOL        = 'h2'
     ALPN_SELECT_CALLBACK = ->(ps){ ps.find { |p| ALPN_PROTOCOL == p }}
     ECDH_CURVES          = 'P-256'
     TMP_ECDH_CALLBACK    = ->(*_){ OpenSSL::PKey::EC.new 'prime256v1' }
-
+  
     ECDH_OPENSSL_MIN_VERSION = '2.0'
     ALPN_OPENSSL_MIN_VERSION = 0x10002001
-
-    def initialize host, port, sni: {}, **options
-      @reactor = Async::Reactor.new
-      @sni = sni
-      @sni_callback = @sni[:callback] || method(:sni_callback)
-      @tcpserver = TCPServer.new(host, port)
-      @sslserver = OpenSSL::SSL::SSLServer.new(@tcpserver, create_ssl_context(options))
-      options.merge! host: host, port: port, sni: sni
-      #TODO: Start server?
+  
+    def initialize(host, port, **opts)
+      @selector = NIO::Selector.new
+  
+      puts "Listening on #{host}:#{port}"
+      @server = TCPServer.new(host, port)
+      @context = create_ssl_context(opts)
+  
+      monitor = @selector.register(@server, :r)
+      monitor.value = proc { |m| accept }
     end
-    # default SNI callback - builds SSLContext from cert/key by domain name in +@sni+
-    # or returns existing one if name is not found
-    #
-    def sni_callback args
-      socket, name = args
-      @contexts ||= {}
-      if @contexts[name]
-        @contexts[name]
-      elsif sni_opts = @sni[name] and Hash === sni_opts
-        @contexts[name] = create_ssl_context sni_opts
-      else
-        socket.context
-      end
-    end
+  
     def run
-      resp = "TEST DATA"
-      @reactor.async(@sslserver) do |server, task|
-        puts "Starting server"
-        while true
-          begin
-            task.with(server.accept) do |sock|
-              puts "Accepted connection"
-              conn = HTTP2::Server.new
-              conn.on(:frame) {|bytes| sock.write(bytes)}
-              conn.on(:stream) do |stream|
-                req, buffer = {}, ''
-                stream.on(:active) {puts "#{conn} #{stream.id}: client opened new stream"}
-                stream.on(:close) {puts "#{conn} #{stream.id}: stream closed"}
-                stream.on(:headers) do |h|
-                  req = Hash[*h.flatten]
-                  puts "#{conn} #{stream.id}: #{req}"
-                end
-                stream.on(:data) do |d|
-                  buffer << d
-                end
-                stream.on(:half_close) do
-                  response = nil
-                  puts "#{conn} #{stream.id}: Responding"
-                  stream.headers({
-                    ':status' => '200',
-                    'content-length' => resp.length.to_s
-                  }, end_stream: false)
-                  stream.data(resp)
-                end
-              end
-              begin
-                while data = sock.read(1024)
-                  conn << data
-                end
-              rescue => e
-                puts "#{e.class} exception: #{e.message} - closing socket."
-                e.backtrace.each { |l| puts "\t" + l }
-                sock.close
-              end
-              puts "#{conn}: No more data"
-            end
-          rescue OpenSSL::SSL::SSLError, Errno::ECONNRESET, Errno::EPIPE,
-                     Errno::ETIMEDOUT, Errno::EHOSTUNREACH => ex
-            puts "Error accepting SSLSocket: #{ex.class}: #{ex.to_s}"
-            retry
-          rescue => e
-            puts "#{e.class}: #{e.message}"
-          end
+      loop do
+        begin
+          @selector.select { |monitor| monitor.value.call(monitor) }
+        rescue => e
+          puts "#{e.class}: #{e.message} (select)"
+          puts e.backtrace.join("\n")
         end
       end
-      @reactor.run
     end
+  
+    def accept
+      sock = @server.accept_nonblock exception: false
+      return sock if sock == :wait_readable
+  
+      ssl_sock = OpenSSL::SSL::SSLSocket.new(sock, @context)
+      ssl_sock.sync = true
+      client,monitor = accept_ssl(ssl_sock)
+  
+      if monitor
+        @selector.interests = :r if client == :wait_readable
+        @selector.interests = :w if client == :wait_writeable
+      else
+        if client == :wait_readable 
+          monitor = @selector.register(ssl_sock, :r)
+          monitor.value = proc { accept_ssl(ssl_sock, monitor) }
+        elsif client == :wait_writeable
+          monitor = @selector.register(ssl_sock, :w)
+          monitor.value = proc { accept_ssl(ssl_sock, monitor) }
+        end
+      end
+    end
+    def accept_ssl ssl_sock, monitor=nil
+      begin
+        #client = ssl_sock.accept
+        client = ssl_sock.accept_nonblock exception: false
+  
+        return [client,monitor] if  client == :wait_readable || client == :wait_writeable
+  
+        #The client will disconnect automatically if ALPN
+        #re-negotiates H2
+        _, port, host = client.peeraddr
+        puts "*** #{host}:#{port} connected"
 
-    # builds a new SSLContext suitable for use in 'h2' connections
-    #
+        connection = Helix::Connection.new client, @selector, monitor
+      rescue => e
+        puts "#{e.class}: #{e.message} (accept)"
+        puts e.backtrace.join("\n")
+        if client
+          @selector.deregister(client)
+          client.close
+        end
+        puts "Closed (accept)"
+      end
+    end
     def create_ssl_context **opts
       ctx                  = OpenSSL::SSL::SSLContext.new
       ctx.ca_file          = opts[:ca_file] if opts[:ca_file]
@@ -101,15 +88,12 @@ module Helix
       ctx.extra_chain_cert = context_extra_chain_cert opts[:extra_chain_cert]
       ctx.key              = context_key opts[:key]
       ctx.options          = opts[:options] || OpenSSL::SSL::SSLContext::DEFAULT_PARAMS[:options]
-      ctx.servername_cb    = @sni_callback
       ctx.ssl_version      = :TLSv1_2
       context_ecdh ctx
       context_set_protocols ctx
       ctx
     end
-
-    private
-
+  
     if OpenSSL::VERSION >= ECDH_OPENSSL_MIN_VERSION
       def context_ecdh ctx
         ctx.ecdh_curves = ECDH_CURVES
@@ -119,7 +103,7 @@ module Helix
         ctx.tmp_ecdh_callback = TMP_ECDH_CALLBACK
       end
     end
-
+  
     def context_cert cert
       case cert
       when String
@@ -129,7 +113,7 @@ module Helix
         cert
       end
     end
-
+  
     def context_key key
       case key
       when String
@@ -139,7 +123,6 @@ module Helix
         key
       end
     end
-
     def context_extra_chain_cert chain
       case chain
       when String
@@ -151,7 +134,7 @@ module Helix
         chain
       end
     end
-
+  
     if OpenSSL::OPENSSL_VERSION_NUMBER >= ALPN_OPENSSL_MIN_VERSION
       def context_set_protocols ctx
         ctx.alpn_protocols = [ALPN_PROTOCOL]
@@ -165,3 +148,5 @@ module Helix
     end
   end
 end
+
+Helix::Server.new("localhost", 1234, key: 'test.key', cert: 'test.crt').run if $PROGRAM_NAME == __FILE__
