@@ -31,19 +31,59 @@ module Helix
           stream.data(resp)
         end
       end
-  
       read
     end
-    def write bytes
-      result = @socket.write_nonblock(bytes, exception: false)
-      if result == :wait_writeable
+    def write bytes, position=0
+      until position == bytes.bytesize
+        result = @socket.write_nonblock(bytes[position..-1], exception: false)
+        if result == :wait_writeable
+          puts "Waiting to complete write"
+          if @monitor
+            @monitor.interests = :w
+          else
+            @monitor = @selector.register(@socket, :w) unless @monitor
+          end
+          @monitor.value = proc {write(bytes, position)}
+        else
+          position += result
+        end
+      end
+    end
+    def write_buffer buffer
+      puts "Writing buffer"
+      buffer.write_to(@socket)
+      if buffer.remaining > 0
+        puts "has remaining, sleeping"
         if @monitor
           @monitor.interests = :w
         else
-          @monitor = @selector.register(@socket, :w) unless monitor
+          @monitor = @selector.register(@socket, :w) unless @monitor
         end
-        @monitor.value = proc {read}
+        @monitor.value = proc {write_buffer buffer}
       end
+     rescue EOFError, Errno::EPIPE, Errno::ECONNRESET => e
+      puts "#{e.class}: #{e.message} (write)"
+      begin
+        _, port, host = @socket.peeraddr
+        puts "*** #{host}:#{port} disconnected"
+      rescue
+        puts "Something disconnected, not sure what"
+      end
+      @selector.deregister(@socket)
+      @socket.close
+      false
+    rescue => e
+      puts "#{e.class}: #{e.message} (write)"
+      puts e.backtrace.join("\n")
+      @selector.deregister(@socket)
+      begin
+        _, port, host = @socket.peeraddr
+        puts "*** #{host}:#{port} disconnected (write)"
+      rescue
+        puts "Something disconnected, not sure what (write)"
+      end
+      @socket.close
+      false
     end
     def read
       until (data = @socket.read_nonblock(4096, exception: false)) == :wait_readable
@@ -53,10 +93,11 @@ module Helix
       if @monitor
         @monitor.interests = :r
       else
-        @monitor = @selector.register(@socket, :r) unless monitor
+        @monitor = @selector.register(@socket, :r) unless @monitor
       end
       @monitor.value = proc {read}
     rescue EOFError, Errno::EPIPE, Errno::ECONNRESET => e
+      puts "#{e.class}: #{e.message} (read)"
       begin
         _, port, host = @socket.peeraddr
         puts "*** #{host}:#{port} disconnected"
@@ -68,6 +109,7 @@ module Helix
       false
     rescue => e
       puts "#{e.class}: #{e.message} (read)"
+      puts e.backtrace.join("\n")
       @selector.deregister(@socket)
       begin
         _, port, host = @socket.peeraddr
