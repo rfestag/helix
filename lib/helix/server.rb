@@ -13,8 +13,9 @@ module Helix
     ECDH_OPENSSL_MIN_VERSION = '2.0'
     ALPN_OPENSSL_MIN_VERSION = 0x10002001
   
-    def initialize(host, port, **opts)
+    def initialize(host, port, **opts, &block)
       @selector = NIO::Selector.new
+      @on_request = block
   
       puts "Listening on #{host}:#{port}"
       @server = TCPServer.new(host, port)
@@ -37,38 +38,26 @@ module Helix
   
     def accept
       sock = @server.accept_nonblock exception: false
-      return sock if sock == :wait_readable
+      return if sock == :wait_readable
   
       ssl_sock = OpenSSL::SSL::SSLSocket.new(sock, @context)
       ssl_sock.sync = true
-      client,monitor = accept_ssl(ssl_sock)
-  
-      if monitor
-        @selector.interests = :r if client == :wait_readable
-        @selector.interests = :w if client == :wait_writeable
-      else
-        if client == :wait_readable 
-          monitor = @selector.register(ssl_sock, :r)
-          monitor.value = proc { accept_ssl(ssl_sock, monitor) }
-        elsif client == :wait_writeable
-          monitor = @selector.register(ssl_sock, :w)
-          monitor.value = proc { accept_ssl(ssl_sock, monitor) }
-        end
-      end
+      accept_ssl(ssl_sock)
     end
     def accept_ssl ssl_sock, monitor=nil
       begin
-        #client = ssl_sock.accept
         client = ssl_sock.accept_nonblock exception: false
+
+        if client == :wait_readable 
+          return await ssl_sock, monitor, :r
+        elsif client == :wait_writeable
+          return await ssl_sock, monitor, :w
+        end
   
-        return [client,monitor] if  client == :wait_readable || client == :wait_writeable
-  
-        #The client will disconnect automatically if ALPN
-        #re-negotiates H2
         _, port, host = client.peeraddr
         puts "*** #{host}:#{port} connected"
 
-        connection = Helix::Connection.new client, @selector, monitor
+        Helix::Connection.new client, @selector, monitor, &@on_request
       rescue => e
         puts "#{e.class}: #{e.message} (accept)"
         puts e.backtrace.join("\n")
@@ -78,6 +67,15 @@ module Helix
         end
         puts "Closed (accept)"
       end
+    end
+    def await socket, monitor, interest
+      if monitor
+        monitor.interests = :r
+      else
+        monitor = @selector.register(socket, :r)
+      end
+      monitor.value = proc { accept_ssl(socket, monitor) }
+      return monitor
     end
     def create_ssl_context **opts
       ctx                  = OpenSSL::SSL::SSLContext.new
@@ -148,5 +146,3 @@ module Helix
     end
   end
 end
-
-Helix::Server.new("localhost", 1234, key: 'test.key', cert: 'test.crt').run if $PROGRAM_NAME == __FILE__

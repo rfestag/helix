@@ -1,12 +1,9 @@
 require "nio"
-require "socket"
-require 'openssl'
 require 'http/2'
 
 module Helix
   class Connection
     def initialize socket, selector, monitor
-      resp = "TEST DATA"
       @socket = socket
       @monitor = monitor
       @selector = selector
@@ -23,19 +20,16 @@ module Helix
         end
         stream.on(:half_close) do
           buffer.flip
-          response = nil
-          stream.headers({
-            ':status' => '200',
-            'content-length' => resp.length.to_s
-          }, end_stream: false)
-          stream.data(resp)
+          headers, body = yield req, buffer
+          stream.headers(headers, end_stream: body.nil?)
+          stream.data(body) unless body.nil?
         end
       end
       read
     end
-    def write bytes, position=0
-      until position == bytes.bytesize
-        result = @socket.write_nonblock(bytes[position..-1], exception: false)
+    def write bytes
+      until bytes.empty?
+        result = @socket.write(bytes.read(16384))
         if result == :wait_writeable
           puts "Waiting to complete write"
           if @monitor
@@ -43,35 +37,10 @@ module Helix
           else
             @monitor = @selector.register(@socket, :w) unless @monitor
           end
-          @monitor.value = proc {write(bytes, position)}
-        else
-          position += result
+          @monitor.value = proc {write(bytes)}
+          break
         end
       end
-    end
-    def write_buffer buffer
-      puts "Writing buffer"
-      buffer.write_to(@socket)
-      if buffer.remaining > 0
-        puts "has remaining, sleeping"
-        if @monitor
-          @monitor.interests = :w
-        else
-          @monitor = @selector.register(@socket, :w) unless @monitor
-        end
-        @monitor.value = proc {write_buffer buffer}
-      end
-     rescue EOFError, Errno::EPIPE, Errno::ECONNRESET => e
-      puts "#{e.class}: #{e.message} (write)"
-      begin
-        _, port, host = @socket.peeraddr
-        puts "*** #{host}:#{port} disconnected"
-      rescue
-        puts "Something disconnected, not sure what"
-      end
-      @selector.deregister(@socket)
-      @socket.close
-      false
     rescue => e
       puts "#{e.class}: #{e.message} (write)"
       puts e.backtrace.join("\n")
@@ -86,7 +55,7 @@ module Helix
       false
     end
     def read
-      until (data = @socket.read_nonblock(4096, exception: false)) == :wait_readable
+      until (data = @socket.read_nonblock(16384, exception: false)) == :wait_readable
         raise EOFError.new if data.nil?
         @conn << data
       end
@@ -97,7 +66,6 @@ module Helix
       end
       @monitor.value = proc {read}
     rescue EOFError, Errno::EPIPE, Errno::ECONNRESET => e
-      puts "#{e.class}: #{e.message} (read)"
       begin
         _, port, host = @socket.peeraddr
         puts "*** #{host}:#{port} disconnected"
